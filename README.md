@@ -81,35 +81,35 @@ Modern engineering and data teams drown in heterogeneous operational data — se
 
 ```mermaid
 graph TD
-    subgraph Client ["🖥️ Frontend — React / Vite / Tailwind CSS v4"]
-        UI["Dashboard / Upload / Investigate / ChatOps / History"]
-        API_Client["Axios HTTP Client"]
-        Charts["Recharts Visualizations"]
+    subgraph Client [Frontend - React / Vite / Tailwind CSS v4]
+        UI[Dashboard / Upload / Investigate / ChatOps / History]
+        API_Client[Axios HTTP Client]
+        Charts[Recharts Visualizations]
     end
 
-    subgraph Server ["⚙️ Backend — FastAPI / Uvicorn"]
-        API["REST API Endpoints"]
-        Parser["Universal Document Parser"]
-        RAG["RAG Service — Chunking & Embedding"]
-        Report["Report Generator"]
-        DB["SQLite Incident Store"]
+    subgraph Server [Backend - FastAPI / Uvicorn]
+        API[REST API Endpoints]
+        Parser[Universal Document Parser]
+        RAG[RAG Service - Chunking and Embedding]
+        Report[Report Generator]
+        DB[SQLite Incident Store]
     end
 
-    subgraph AI ["🤖 AI & Vector Infrastructure"]
-        ChromaDB[("ChromaDB Vector Store")]
-        EmbedModel["SentenceTransformer\nall-MiniLM-L6-v2"]
-        Groq["Groq API\nLlama 3.3 70B Versatile"]
+    subgraph AI_Store [AI and Vector Infrastructure]
+        ChromaDB[(ChromaDB Vector Store)]
+        EmbedModel[SentenceTransformer - all-MiniLM-L6-v2]
+        Groq[Groq API - Llama 3.3 70B Versatile]
     end
 
     UI --> API_Client
-    API_Client -->|HTTP| API
+    API_Client --> API
     API --> Parser
     API --> RAG
     API --> Report
     API --> DB
     RAG --> EmbedModel
     RAG --> ChromaDB
-    API -->|LLM Inference| Groq
+    API --> Groq
 ```
 
 ### Data Flow
