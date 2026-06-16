@@ -1,20 +1,37 @@
 from datetime import datetime
 import os
-
-os.environ["HF_HOME"] = "./hf_cache"
-os.environ["TRANSFORMERS_CACHE"] = "./hf_cache"
-
+import requests
 import chromadb
-from sentence_transformers import SentenceTransformer
 from services.log_parser import parse_file_to_chunks
 
 # ==========================================
-# EMBEDDING MODEL
+# SERVERLESS HUGGING FACE EMBEDDINGS
 # ==========================================
 
-model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HF_API_KEY")
+API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+
+def get_embeddings(texts):
+    if not texts:
+        return []
+    is_single = isinstance(texts, str)
+    inputs = [texts] if is_single else list(texts)
+    
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    try:
+        response = requests.post(API_URL, headers=headers, json={"inputs": inputs}, timeout=20)
+        if response.status_code == 200:
+            result = response.json()
+            return result[0] if is_single else result
+        else:
+            print(f"HF API Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Serverless embedding error: {str(e)}")
+    
+    # Fallback: return zero vectors of length 384 (all-MiniLM-L6-v2 dimension)
+    print("Warning: HF API failed, falling back to zero embeddings")
+    zero_vector = [0.0] * 384
+    return zero_vector if is_single else [zero_vector] * len(inputs)
 
 # ==========================================
 # CHROMA DB
@@ -46,7 +63,7 @@ def index_file(filepath, filename):
         print(f"Error clearing previous index for {filename}: {str(e)}")
         
     documents = [c["content"] for c in chunks]
-    embeddings = [model.encode(c["content"]).tolist() for c in chunks]
+    embeddings = get_embeddings(documents)
     ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
     metadatas = []
     
@@ -74,7 +91,7 @@ def add_log(log_text, filename):
         index_file(filepath, filename)
     else:
         # Fallback if no file exists on disk
-        embedding = model.encode(log_text).tolist()
+        embedding = get_embeddings(log_text)
         try:
             collection.delete(where={"source": filename})
             collection.delete(ids=[filename])
@@ -113,9 +130,7 @@ def search_logs(query):
     else:
         query_text = query
 
-    query_embedding = model.encode(
-        query_text
-    ).tolist()
+    query_embedding = get_embeddings(query_text)
 
     total_logs = len(
         collection.get()["ids"]
