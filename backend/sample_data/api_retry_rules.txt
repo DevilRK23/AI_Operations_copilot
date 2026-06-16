@@ -1,0 +1,9 @@
+Secure Retry Policy Document
+Version: 1.2
+Owner: Security & Infrastructure Team
+
+Rules:
+1. Any network timeout to the payment gateway (exceeding 10000ms) must trigger a retry.
+2. The retry delay must use exponential backoff (e.g. 2s, 4s, 8s).
+3. Do not attempt more than 3 retries.
+4. After 3 failed attempts, log the incident as CRITICAL and notify PagerDuty immediately.

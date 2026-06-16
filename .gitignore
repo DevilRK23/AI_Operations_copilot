@@ -1,0 +1,31 @@
+# Virtual Environment
+backend/venv/
+venv/
+.venv/
+env/
+
+# Package managers
+node_modules/
+frontend/node_modules/
+
+# Local cache & vector databases
+backend/hf_cache/
+backend/vector_db/
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Environment variables
+.env
+backend/.env
+
+# Python compilation cache
+__pycache__/
+backend/__pycache__/
+backend/services/__pycache__/
+*.pyc
+
+# IDEs & System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+2026-06-15 14:30:05 INFO checkout_service: Initiating checkout request transaction_id=tx_99831
+2026-06-15 14:30:07 ERROR inventory_service: Stock deduction failed for sku=SKU-992 (out of stock)
+2026-06-15 14:30:07 ERROR checkout_service: Checkout failed due to inventory check failure
+2026-06-15 14:30:10 WARN checkout_service: Rolling back payment authorization for transaction_id=tx_99831
+2026-06-15 14:30:12 INFO checkout_service: Rollback successful. Transaction marked as failed.

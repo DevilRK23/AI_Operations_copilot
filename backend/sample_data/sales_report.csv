@@ -1,0 +1,6 @@
+transaction_id,item_name,quantity,total_amount,payment_method,status
+TX1001,Laptop,1,1200.00,CreditCard,Success
+TX1002,Headphones,2,150.00,PayPal,Success
+TX1003,Monitor,1,300.00,DebitCard,Failed
+TX1004,Keyboard,3,135.00,CreditCard,Success
+TX1005,Mouse,1,25.00,ApplePay,Success
