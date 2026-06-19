@@ -17,7 +17,10 @@ def get_embeddings(texts):
     is_single = isinstance(texts, str)
     inputs = [texts] if is_single else list(texts)
     
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    headers = {}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+        
     try:
         response = requests.post(API_URL, headers=headers, json={"inputs": inputs}, timeout=20)
         if response.status_code == 200:
@@ -49,22 +52,29 @@ collection = client.get_or_create_collection(
 # ADD / INDEX LOG
 # ==========================================
 
-def index_file(filepath, filename):
+def index_file(filepath, filename, user_id=None):
     chunks = parse_file_to_chunks(filepath)
     if not chunks:
         return
     
     try:
-        # Delete existing items matching source filename
-        collection.delete(where={"source": filename})
-        # Delete direct ID match too, in case of older structure
-        collection.delete(ids=[filename])
+        # Delete existing items matching source filename and user_id to avoid duplication
+        if user_id is not None:
+            # Check if Chroma supports where filter delete
+            collection.delete(where={"$and": [{"source": filename}, {"user_id": user_id}]})
+        else:
+            collection.delete(where={"source": filename})
+            collection.delete(ids=[filename])
     except Exception as e:
-        print(f"Error clearing previous index for {filename}: {str(e)}")
+        # If $and is not supported or errors, fallback to standard delete
+        try:
+            collection.delete(where={"source": filename})
+        except Exception as inner_e:
+            print(f"Error clearing previous index for {filename}: {str(inner_e)}")
         
     documents = [c["content"] for c in chunks]
     embeddings = get_embeddings(documents)
-    ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
+    ids = [f"{filename}_user_{user_id}_chunk_{i}" if user_id is not None else f"{filename}_chunk_{i}" for i in range(len(chunks))]
     metadatas = []
     
     for i, c in enumerate(chunks):
@@ -74,6 +84,8 @@ def index_file(filepath, filename):
             "uploaded_at": str(datetime.utcnow()),
             **c.get("metadata", {})
         }
+        if user_id is not None:
+            meta["user_id"] = user_id
         metadatas.append(meta)
         
     collection.add(
@@ -82,37 +94,47 @@ def index_file(filepath, filename):
         ids=ids,
         metadatas=metadatas
     )
-    print(f"Indexed {len(chunks)} chunks for {filename}")
+    print(f"Indexed {len(chunks)} chunks for {filename} (User ID: {user_id})")
 
-def add_log(log_text, filename):
+def add_log(log_text, filename, user_id=None):
     # Backward compatible helper
     filepath = f"uploads/{filename}"
     if os.path.exists(filepath):
-        index_file(filepath, filename)
+        index_file(filepath, filename, user_id)
     else:
         # Fallback if no file exists on disk
         embedding = get_embeddings(log_text)
         try:
-            collection.delete(where={"source": filename})
-            collection.delete(ids=[filename])
+            if user_id is not None:
+                collection.delete(where={"$and": [{"source": filename}, {"user_id": user_id}]})
+            else:
+                collection.delete(where={"source": filename})
+                collection.delete(ids=[filename])
         except:
             pass
+        
+        meta = {
+            "source": filename,
+            "type": "universal_doc",
+            "uploaded_at": str(datetime.utcnow())
+        }
+        if user_id is not None:
+            meta["user_id"] = user_id
+            
+        doc_id = f"{filename}_user_{user_id}" if user_id is not None else filename
+        
         collection.add(
             documents=[log_text],
             embeddings=[embedding],
-            ids=[filename],
-            metadatas=[{
-                "source": filename,
-                "type": "universal_doc",
-                "uploaded_at": str(datetime.utcnow())
-            }]
+            ids=[doc_id],
+            metadatas=[meta]
         )
 
 # ==========================================
 # SEARCH LOGS
 # ==========================================
 
-def search_logs(query):
+def search_logs(query, user_id=None):
     filename = query
     is_file = False
     
@@ -132,16 +154,20 @@ def search_logs(query):
 
     query_embedding = get_embeddings(query_text)
 
-    total_logs = len(
-        collection.get()["ids"]
-    )
+    # Filter by user if specified
+    where_filter = {"user_id": user_id} if user_id is not None else None
+
+    # Get matching records
+    try:
+        all_ids = collection.get(where=where_filter)["ids"]
+        total_logs = len(all_ids)
+    except Exception:
+        total_logs = 10
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=min(
-            10,
-            max(1, total_logs)
-        )
+        n_results=min(10, max(1, total_logs)),
+        where=where_filter
     )
 
     # Remove self-match
@@ -177,8 +203,9 @@ def search_logs(query):
 # DASHBOARD HELPERS
 # ==========================================
 
-def get_total_incidents():
-    results = collection.get()
+def get_total_incidents(user_id=None):
+    where_filter = {"user_id": user_id} if user_id is not None else None
+    results = collection.get(where=where_filter)
     if not results or "metadatas" not in results or not results["metadatas"]:
         return 0
     sources = set()
@@ -187,8 +214,9 @@ def get_total_incidents():
             sources.add(meta["source"])
     return len(sources) if sources else len(results["ids"])
 
-def get_recent_incidents(limit=10):
-    results = collection.get()
+def get_recent_incidents(limit=10, user_id=None):
+    where_filter = {"user_id": user_id} if user_id is not None else None
+    results = collection.get(where=where_filter)
     if not results or "metadatas" not in results or not results["metadatas"]:
         return []
     

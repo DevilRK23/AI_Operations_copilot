@@ -1,10 +1,19 @@
 import chromadb
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from dotenv import load_dotenv
 from pathlib import Path
+import os
+import json
+import re 
+import traceback
+import uuid
+from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
+
+# Imports of local modules
 from services.log_parser import read_logs, parse_file_to_chunks
 from services.rag_service import (
     add_log,
@@ -13,11 +22,20 @@ from services.rag_service import (
     get_recent_incidents
 )
 from services.report_service import generate_report
-import os
-import json
-import re 
-import traceback
-from datetime import datetime, timedelta
+from services.db_service import (
+    init_db,
+    create_user,
+    get_user_by_username,
+    get_user_by_id,
+    update_user_api_key
+)
+from services.auth_service import (
+    get_current_user,
+    create_access_token,
+    get_password_hash,
+    verify_password
+)
+from services.agent_workflow import run_agent_analysis
 
 # ==========================================
 # ENVIRONMENT SETUP
@@ -38,8 +56,22 @@ client = chromadb.PersistentClient(
 collection = client.get_or_create_collection(
     name="incident_logs"
 )
+
 # ==========================================
-# FASTAPI
+# PYDANTIC SCHEMAS FOR AUTH
+# ==========================================
+
+class UserRegister(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: str = Field(..., min_length=5, max_length=100)
+    password: str = Field(..., min_length=6)
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+# ==========================================
+# FASTAPI APP
 # ==========================================
 
 app = FastAPI(
@@ -55,8 +87,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize database on startup
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
 # ==========================================
-# HOME
+# PUBLIC API - HOME & HEALTH
 # ==========================================
 
 @app.get("/")
@@ -65,8 +102,62 @@ def home():
         "message": "AI Operations Copilot Running"
     }
 
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "vector_db": "connected",
+        "llm": "available",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 # ==========================================
-# GENERAL AI ASSISTANT
+# AUTH ENDPOINTS
+# ==========================================
+
+@app.post("/auth/register")
+def register(user_data: UserRegister):
+    existing = get_user_by_username(user_data.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already registered")
+        
+    hashed = get_password_hash(user_data.password)
+    user_id = create_user(user_data.username, user_data.email, hashed)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Registration failed")
+        
+    return {"message": "Registration successful", "user_id": user_id}
+
+@app.post("/auth/login")
+def login(login_data: UserLogin):
+    user = get_user_by_username(login_data.username)
+    if not user or not verify_password(login_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+        
+    token = create_access_token({"sub": str(user["id"])})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": user["username"]
+    }
+
+@app.get("/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    return {
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "email": current_user["email"],
+        "api_key": current_user["api_key"]
+    }
+
+@app.post("/auth/api-key")
+def generate_api_key(current_user: dict = Depends(get_current_user)):
+    new_key = f"ops_copilot_{uuid.uuid4().hex}"
+    update_user_api_key(current_user["id"], new_key)
+    return {"api_key": new_key}
+
+# ==========================================
+# PUBLIC DEMO ENDPOINT (UNPROTECTED)
 # ==========================================
 
 @app.get("/ask")
@@ -101,11 +192,11 @@ def ask(question: str):
         }
 
 # ==========================================
-# LOG UPLOAD + INDEXING
+# SECURE LOG UPLOAD + INDEXING
 # ==========================================
 
 @app.post("/upload-log")
-async def upload_log(file: UploadFile = File(...)):
+async def upload_log(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     try:
         os.makedirs("uploads", exist_ok=True)
         content = await file.read()
@@ -114,8 +205,8 @@ async def upload_log(file: UploadFile = File(...)):
         with open(filepath, "wb") as f:
             f.write(content)
 
-        # Triggers universal indexing based on file extension
-        add_log("", file.filename)
+        # Triggers universal indexing scoped to the logged-in user
+        add_log("", file.filename, user_id=current_user["id"])
 
         return {
             "message": "File uploaded and indexed successfully",
@@ -132,7 +223,7 @@ async def upload_log(file: UploadFile = File(...)):
 # ==========================================
 
 @app.get("/analyze-log")
-def analyze_log(filename: str):
+def analyze_log(filename: str, current_user: dict = Depends(get_current_user)):
     try:
         filepath = f"uploads/{filename}"
         logs = read_logs(filepath)
@@ -167,13 +258,13 @@ def analyze_log(filename: str):
         }
 
 # ==========================================
-# SEARCH HISTORICAL INCIDENTS
+# SEARCH HISTORICAL INCIDENTS (SCOPED)
 # ==========================================
 
 @app.get("/search-incidents")
-def search_incidents(query: str):
+def search_incidents(query: str, current_user: dict = Depends(get_current_user)):
     try:
-        results = search_logs(query)
+        results = search_logs(query, user_id=current_user["id"])
         return {
             "query": query,
             "ids": results["ids"],
@@ -280,18 +371,19 @@ def classify_document(filename, content):
     return "text"
 
 # ==========================================
-# AI INVESTIGATION (RAG)
+# SECURE AI INVESTIGATION (RAG VIA LANGGRAPH)
 # ==========================================
 
 @app.get("/investigate")
-def investigate(query: str): 
+def investigate(query: str, current_user: dict = Depends(get_current_user)): 
     try:
         current_logs = ""
         filepath = f"uploads/{query}"
         if os.path.exists(filepath):
             current_logs = read_logs(filepath)
 
-        results = search_logs(query)
+        # Scoped search
+        results = search_logs(query, user_id=current_user["id"])
         
         has_matches = True
         if (
@@ -339,120 +431,17 @@ def investigate(query: str):
             context = "No historical matching documents available."
             top_matches = []
 
-        doc_type = classify_document(query, current_logs if current_logs else query)
-        
-        if doc_type == "log":
-            system_prompt = """
-You are an Expert Site Reliability Engineer (SRE).
-Analyze the CURRENT INCIDENT LOG. Historical logs are provided only as supporting context.
-Return a valid JSON object summarizing the incident investigation:
-{
-  "root_cause": "Detailed analysis of what triggered the incident",
-  "evidence": ["Log line or pattern showing the error", "Additional log evidence"],
-  "severity": "Critical / High / Medium / Low",
-  "impact": ["Description of affected services, performance, or users"],
-  "recommended_fix": ["Step-by-step resolution or configuration fix"],
-  "prevention_strategy": ["Monitoring rules, circuit breakers, or scaling configs to prevent recurrence"]
-}
-"""
-            user_prompt = f"""
-Current Incident:
-{query}
-
-Current Incident Logs:
-{current_logs if current_logs else query}
-
-Most Similar Incident:
-{best_match}
-
-Historical Incident Logs:
-{context}
-
-Instructions:
-1. Determine root cause primarily from CURRENT INCIDENT LOG.
-2. Use HISTORICAL LOGS only as supporting evidence.
-3. If historical logs conflict with current log, prioritize current log.
-"""
-        elif doc_type == "tabular":
-            system_prompt = """
-You are an Expert Data Analyst.
-Analyze the CURRENT DATASET. Historical datasets or tables are provided only as supporting context.
-Return a valid JSON object summarizing the data analysis:
-{
-  "root_cause": "A high-level synthesis of key findings, major patterns, or data anomalies identified",
-  "evidence": ["Specific data rows, statistics, values, or anomalies supporting the findings"],
-  "severity": "Critical / High / Medium / Low (indicating the priority/importance of the data findings)",
-  "impact": ["Operational or business implications of these data trends"],
-  "recommended_fix": ["Actionable insights or strategic recommendations based on the data"],
-  "prevention_strategy": ["Continuous monitoring metrics, data validation checks, or future dashboard adjustments"]
-}
-"""
-            user_prompt = f"""
-Current Dataset:
-{query}
-
-Current Data Content:
-{current_logs if current_logs else query}
-
-Most Similar Dataset:
-{best_match}
-
-Historical Data Logs:
-{context}
-
-Instructions:
-1. Identify key findings, anomalies, and insights from the CURRENT DATA content.
-2. Refer to HISTORICAL records only for comparison or context.
-"""
-        else:
-            system_prompt = """
-You are an Expert Document Analysis Assistant.
-Analyze the CURRENT DOCUMENT text. Historical documents are provided only as supporting context.
-Return a valid JSON object summarizing the document:
-{
-  "root_cause": "Main thesis, core summary, or primary topic of the document",
-  "evidence": ["Key facts, quotes, sections, or claims made in the document"],
-  "severity": "Critical / High / Medium / Low (representing the importance/urgency level of the document content)",
-  "impact": ["The significance, key takeaways, or downstream implications of the document contents"],
-  "recommended_fix": ["Actionable next steps, recommended tasks, or solutions suggested by the content"],
-  "prevention_strategy": ["Long-term strategy, follow-up research questions, or reference checks"]
-}
-"""
-            user_prompt = f"""
-Current Document:
-{query}
-
-Current Document Text:
-{current_logs if current_logs else query}
-
-Most Similar Document:
-{best_match}
-
-Historical Documents:
-{context}
-
-Instructions:
-1. Synthesize the core summary, main takeaways, and recommendations from the CURRENT DOCUMENT.
-2. Use HISTORICAL documents for reference comparison only.
-"""
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ]
+        # Run the Multi-Agent LangGraph Workflow instead of the raw Groq Client
+        investigation = run_agent_analysis(
+            query=query,
+            content=current_logs if current_logs else query,
+            best_match=best_match,
+            context=context
         )
 
-        ai_response = response.choices[0].message.content.strip()
-        investigation = extract_json(ai_response)
+        # If investigation failed/returned raw text, parse it
+        if isinstance(investigation, str):
+            investigation = extract_json(investigation)
 
         severity_level = normalize_severity(
             investigation.get("severity", "Medium")
@@ -497,13 +486,13 @@ Instructions:
         }
 
 # ==========================================
-# DASHBOARD STATS
+# SECURE DASHBOARD & STATS (SCOPED)
 # ==========================================    
+
 @app.get("/analytics")
-def analytics():
-    # Dynamically extract some counts if available, otherwise return defaults
+def analytics(current_user: dict = Depends(get_current_user)):
     try:
-        total = get_total_incidents()
+        total = get_total_incidents(user_id=current_user["id"])
         return {
             "critical": max(0, int(total * 0.2)),
             "high": max(1, int(total * 0.4)),
@@ -518,14 +507,10 @@ def analytics():
             "low": 0
         }
 
-# ==========================================
-# INCIDENT RCA REPORT
-# ==========================================
-
 @app.get("/incident-report")
-def incident_report(query: str):
+def incident_report(query: str, current_user: dict = Depends(get_current_user)):
     try:
-        data = investigate(query)
+        data = investigate(query, current_user=current_user)
         if "error" in data:
             return PlainTextResponse(f"Error generating report: {data['error']}", status_code=400)
             
@@ -600,10 +585,9 @@ Similar Comparison: {data.get("similar_incident", "None")}
 {prevention_str}
 
 ---
-*Report generated by AI Copilot Engine.*
+*Report generated by AI Copilot Engine via Multi-Agent Workflow.*
 """
         
-        # Format download filename cleanly (e.g. sales_report_csv_analysis.md)
         safe_filename = re.sub(r"[^\w\-.]", "_", query)
         headers = {
             "Content-Disposition": f'attachment; filename="{safe_filename.replace(".", "_")}_analysis.md"'
@@ -615,10 +599,9 @@ Similar Comparison: {data.get("similar_incident", "None")}
         return PlainTextResponse(f"Error generating report: {str(e)}", status_code=500)
     
 @app.get("/stats")
-def stats():
+def stats(current_user: dict = Depends(get_current_user)):
     try:
-        total_incidents = get_total_incidents()
-        # Proportionate values based on total
+        total_incidents = get_total_incidents(user_id=current_user["id"])
         critical = max(0, int(total_incidents * 0.15))
         high = max(0, int(total_incidents * 0.35))
         medium = max(0, int(total_incidents * 0.4))
@@ -636,10 +619,9 @@ def stats():
         }
     
 @app.get("/recent-incidents")
-def recent_incidents():
+def recent_incidents(current_user: dict = Depends(get_current_user)):
     try:
-        # Get actual indexed documents
-        ids = get_recent_incidents(10)
+        ids = get_recent_incidents(10, user_id=current_user["id"])
         return {
             "incidents": ids
         }
@@ -648,19 +630,10 @@ def recent_incidents():
             "error": str(e)
         }
     
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "vector_db": "connected",
-        "llm": "available",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
 @app.get("/dashboard")
-def dashboard():
+def dashboard(current_user: dict = Depends(get_current_user)):
     try:
-        total = get_total_incidents()
+        total = get_total_incidents(user_id=current_user["id"])
         critical = max(0, int(total * 0.15))
         high = max(0, int(total * 0.35))
         medium = max(0, int(total * 0.4))
@@ -682,9 +655,10 @@ def dashboard():
         }
 
 @app.get("/chatops")
-def chatops(question: str):
+def chatops(question: str, current_user: dict = Depends(get_current_user)):
     try:
-        results = search_logs(question)
+        # Search queries are isolated to current user
+        results = search_logs(question, user_id=current_user["id"])
         has_matches = True
         if (
             not results
@@ -760,7 +734,7 @@ def groq_test():
     }
 
 @app.get("/timeline")
-def timeline(logfile: str):
+def timeline(logfile: str, current_user: dict = Depends(get_current_user)):
     try:
         filepath = f"uploads/{logfile}"
         if not os.path.exists(filepath):
